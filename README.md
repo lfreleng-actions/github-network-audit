@@ -58,9 +58,13 @@ github-network-audit report --org lfreleng-actions --repo path-check-action
 
 The tool writes reports to the `{org}/` directory:
 
-- `allowlist.json` - Full allowlist with metadata
+- `all_endpoints.json` - Complete endpoint inventory
+- `allowlist.json` - Deduplicated allowlist with metadata
 - `allowlist.csv` - Spreadsheet-friendly format
 - `allowlist.md` - Markdown with harden-runner config snippet
+
+Use `--repo` to produce repo-scoped output files
+(e.g. `allowlist_path-check-action.json`).
 
 ## Data Sources
 

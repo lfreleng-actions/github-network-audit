@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -41,7 +42,7 @@ class NetworkAuditCollector:
         self.session.headers.update({"Accept": "application/json"})
 
     def _cache_path(self, *parts: str) -> Path:
-        """Build a cache file path and ensure parent dirs exist.
+        """Build a cache file path.
 
         Args:
             *parts: Path components relative to base_dir.
@@ -49,9 +50,7 @@ class NetworkAuditCollector:
         Returns:
             Full path to the cache file.
         """
-        path = self.base_dir.joinpath(*parts)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
+        return self.base_dir.joinpath(*parts)
 
     def _read_cache(self, *parts: str) -> dict | list | None:
         """Read cached JSON data from disk.
@@ -60,11 +59,17 @@ class NetworkAuditCollector:
             *parts: Path components relative to base_dir.
 
         Returns:
-            Parsed JSON data or None if not cached.
+            Parsed JSON data or None if not cached or corrupt.
         """
         path = self._cache_path(*parts)
         if path.exists():
-            result: dict | list = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                result: dict | list = json.loads(
+                    path.read_text(encoding="utf-8"),
+                )
+            except json.JSONDecodeError:
+                logger.warning("Corrupt cache file: %s", path)
+                return None
             return result
         return None
 
@@ -79,6 +84,7 @@ class NetworkAuditCollector:
             Path to the written cache file.
         """
         path = self._cache_path(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -294,5 +300,49 @@ class NetworkAuditCollector:
 
         data: dict = resp.json()
         self._write_cache(data, *cache_parts)
-        time.sleep(0.2)
         return data
+
+    def fetch_run_details_batch(
+        self,
+        repo: str,
+        run_ids: list[str],
+        *,
+        refresh: bool = False,
+        workers: int = 8,
+    ) -> dict[str, dict | None]:
+        """Fetch multiple run details in parallel.
+
+        Args:
+            repo: Repository name.
+            run_ids: List of workflow run IDs.
+            refresh: Force refresh even if cached data exists.
+            workers: Maximum concurrent requests.
+
+        Returns:
+            Mapping of run_id to detail dict (or None).
+        """
+        results: dict[str, dict | None] = {}
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    self.fetch_run_detail,
+                    repo,
+                    rid,
+                    refresh=refresh,
+                ): rid
+                for rid in run_ids
+            }
+            for future in as_completed(futures):
+                rid = futures[future]
+                try:
+                    results[rid] = future.result()
+                except Exception:
+                    logger.warning(
+                        "Unexpected error for run %s in %s",
+                        rid,
+                        repo,
+                    )
+                    results[rid] = None
+
+        return results

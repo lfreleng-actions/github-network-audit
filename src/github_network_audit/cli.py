@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import click
 import typer
 from rich.console import Console
 
@@ -44,6 +45,12 @@ def collect(
         envvar="GITHUB_TOKEN",
         help="GitHub API token for GraphQL queries.",
     ),
+    workers: int = typer.Option(
+        8,
+        "--workers",
+        "-w",
+        help="Concurrent requests for run details.",
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -77,10 +84,11 @@ def collect(
     else:
         repo_names = [r["name"] for r in active]
 
-    for repo_name in repo_names:
+    total = len(repo_names)
+    for idx, repo_name in enumerate(repo_names, start=1):
         console.print()
         console.print(
-            f"[bold cyan]Processing: {repo_name}[/bold cyan]",
+            f"[bold cyan]Processing {idx}/{total}: {repo_name}[/bold cyan]",
         )
 
         runs = collector.fetch_repo_runs(
@@ -94,17 +102,18 @@ def collect(
             f"  Runs with network data: {len(detail_runs)}",
         )
 
-        for i, run in enumerate(detail_runs):
-            run_id = run["id"]
-            collector.fetch_run_detail(
+        if detail_runs:
+            run_ids = [r["id"] for r in detail_runs]
+            collector.fetch_run_details_batch(
                 repo_name,
-                run_id,
+                run_ids,
                 refresh=refresh,
+                workers=workers,
             )
-            if (i + 1) % 10 == 0 or (i + 1) == len(detail_runs):
-                console.print(
-                    f"    Fetched {i + 1}/{len(detail_runs)} details",
-                )
+            console.print(
+                f"    Fetched {len(detail_runs)} details",
+                f"({workers} workers)",
+            )
 
         console.print(
             f"  [green]✓[/green] Done with {repo_name}",
@@ -129,6 +138,10 @@ def report(
     output_format: str = typer.Option(
         "all",
         help="Output format: md, csv, json, or all.",
+        click_type=click.Choice(
+            ["all", "json", "csv", "md"],
+            case_sensitive=False,
+        ),
     ),
     repo: str | None = typer.Option(
         None,

@@ -315,7 +315,15 @@ class NetworkAuditReporter:
 
         Returns:
             The deduplicated allowlist.
+
+        Raises:
+            ValueError: If output_format is not recognized.
         """
+        valid_formats = {"json", "csv", "md", "all"}
+        if output_format not in valid_formats:
+            msg = f"Unknown format '{output_format}'. Valid options: {', '.join(sorted(valid_formats))}"
+            raise ValueError(msg)
+
         all_endpoints = self._collect_all_endpoints(
             repo_filter=repo_filter,
         )
@@ -330,14 +338,13 @@ class NetworkAuditReporter:
             len(allowlist),
         )
 
-        self._write_json(
-            all_endpoints,
-            self.base_dir / "all_endpoints.json",
-        )
-
         suffix = f"_{repo_filter}" if repo_filter else ""
 
         if output_format in ("json", "all"):
+            self._write_json(
+                all_endpoints,
+                self.base_dir / f"all_endpoints{suffix}.json",
+            )
             self._write_json(
                 allowlist,
                 self.base_dir / f"allowlist{suffix}.json",
