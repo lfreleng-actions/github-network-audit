@@ -1,0 +1,214 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Connection allowlist validation workflow
+#
+# This workflow exercises the allowlist produced for lfreleng-actions
+# (from `lfreleng-actions/allowlist.*`) against a locked-down
+# harden-runner configuration. It verifies that:
+#
+#   * five endpoints that should be permitted are reachable, and
+#   * five endpoints that should be blocked are NOT reachable.
+#
+# The allowlist is sourced from repository/org variables so that
+# downstream workflows can reference a single variable instead of
+# inlining large boilerplate lists.
+#
+# Expected variables (configure at repo or org level):
+#
+#   CONNECTION_WHITELIST
+#     Newline-separated `host:port` entries (same format used by
+#     harden-runner's `allowed-endpoints`). Populate from
+#     `lfreleng-actions/allowlist.md`.
+#
+#   VEXXHOST_CIDR_BLOCKS
+#     Newline-separated IPv4/IPv6 CIDR blocks for AS33028 (VEXXHOST).
+#     Populate from `resources/VEXXHOST.txt`. NOTE: harden-runner does
+#     not accept raw CIDRs in `allowed-endpoints` (it is DNS-based);
+#     this variable is consumed for reporting and for non-harden-runner
+#     egress controls (e.g. iptables on self-hosted runners or the
+#     StepSecurity Policy Store).
+
+name: "Test Connection Allowlist 🧪"
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # ---------------------------------------------------------------
+  # Positive test: whitelisted endpoints MUST be reachable
+  # ---------------------------------------------------------------
+  positive-connection-tests:
+    name: "Positive (allowed endpoints must connect)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: block
+          disable-sudo: true
+          allowed-endpoints: ${{ vars.CONNECTION_WHITELIST }}
+
+      - name: "Run positive connection tests"
+        shell: bash
+        env:
+          # Five endpoints that must be present in CONNECTION_WHITELIST
+          POSITIVE_TARGETS: |
+            api.github.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
+            ghcr.io:443
+            raw.githubusercontent.com:443
+        run: |
+          set -u
+          summary="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## ✅ Positive Connection Tests"
+            echo ""
+            echo "Endpoints expected to be **permitted** by harden-runner"
+            echo "(\`egress-policy: block\` with \`CONNECTION_WHITELIST\`)."
+            echo ""
+            echo "| Endpoint | Expected | Result |"
+            echo "| -------- | -------- | ------ |"
+          } >> "$summary"
+
+          failures=0
+          while IFS= read -r target; do
+            [ -z "$target" ] && continue
+            host="${target%:*}"
+            port="${target##*:}"
+            if timeout 10 bash -c "</dev/tcp/${host}/${port}" 2>/dev/null; then
+              result="✅ connected"
+            else
+              result="❌ FAILED"
+              failures=$((failures + 1))
+            fi
+            echo "| \`${target}\` | allowed | ${result} |" >> "$summary"
+          done <<< "$POSITIVE_TARGETS"
+
+          {
+            echo ""
+            echo "**Failures:** ${failures} / 5"
+          } >> "$summary"
+
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::${failures} allowed endpoint(s) were blocked"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------
+  # Negative test: non-whitelisted endpoints MUST be blocked
+  # ---------------------------------------------------------------
+  negative-connection-tests:
+    name: "Negative (non-allowed endpoints must block)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: block
+          disable-sudo: true
+          allowed-endpoints: ${{ vars.CONNECTION_WHITELIST }}
+
+      - name: "Run negative connection tests"
+        shell: bash
+        env:
+          # Five endpoints that must NOT appear in CONNECTION_WHITELIST
+          NEGATIVE_TARGETS: |
+            www.example.org:443
+            www.wikipedia.org:443
+            www.cloudflare.com:443
+            www.bbc.co.uk:443
+            www.amazon.com:443
+        run: |
+          set -u
+          summary="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## 🚫 Negative Connection Tests"
+            echo ""
+            echo "Endpoints expected to be **blocked** by harden-runner"
+            echo "(not present in \`CONNECTION_WHITELIST\`)."
+            echo ""
+            echo "| Endpoint | Expected | Result |"
+            echo "| -------- | -------- | ------ |"
+          } >> "$summary"
+
+          failures=0
+          while IFS= read -r target; do
+            [ -z "$target" ] && continue
+            host="${target%:*}"
+            port="${target##*:}"
+            if timeout 10 bash -c "</dev/tcp/${host}/${port}" 2>/dev/null; then
+              result="❌ LEAKED (connected)"
+              failures=$((failures + 1))
+            else
+              result="✅ blocked"
+            fi
+            echo "| \`${target}\` | blocked | ${result} |" >> "$summary"
+          done <<< "$NEGATIVE_TARGETS"
+
+          {
+            echo ""
+            echo "**Leaks:** ${failures} / 5"
+          } >> "$summary"
+
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::${failures} endpoint(s) reached; not allowlisted"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------
+  # VEXXHOST CIDR report (informational)
+  # ---------------------------------------------------------------
+  vexxhost-cidr-report:
+    name: "VEXXHOST CIDR variable report"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    needs: [positive-connection-tests, negative-connection-tests]
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
+      - name: "Summarise VEXXHOST CIDR blocks"
+        shell: bash
+        env:
+          VEXXHOST_CIDR_BLOCKS: ${{ vars.VEXXHOST_CIDR_BLOCKS }}
+        run: |
+          set -u
+          summary="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## 🌐 VEXXHOST CIDR Blocks"
+            echo ""
+            echo "Raw CIDR list supplied via the \`VEXXHOST_CIDR_BLOCKS\`"
+            echo "repository/org variable. This is informational: "
+            echo "harden-runner's \`allowed-endpoints\` is DNS-based and"
+            echo "does not accept CIDRs directly. Use this list with"
+            echo "iptables, self-hosted runner firewalls, or the"
+            echo "StepSecurity Policy Store."
+            echo ""
+            echo '```text'
+            printf '%s\n' "${VEXXHOST_CIDR_BLOCKS:-<unset>}"
+            echo '```'
+          } >> "$summary"
