@@ -5,8 +5,9 @@
 
 Parallel TCP connect tests for GitHub Actions hardening workflows.
 
-The script reads a newline-separated list of ``host:port`` targets from
-an environment variable and probes each one concurrently using
+The script reads a whitespace-separated list of ``host:port`` targets
+(one per line is the conventional form, but spaces or tabs also work)
+from an environment variable and probes each one concurrently using
 ``asyncio``. Two modes are supported:
 
 * ``permitted`` — targets are expected to connect. Each target is
@@ -26,8 +27,9 @@ Why a Python script rather than inline bash?
 * Wall-clock is bounded deterministically. ``--overall-timeout`` caps
   the entire probe phase; results collected so far are still rendered
   to ``$GITHUB_STEP_SUMMARY`` and the exit status reflects the verdict.
-* Expected pass/fail counts derive from the number of input lines, so
-  the job scales as you add or remove endpoints from the variable.
+* Expected pass/fail counts derive from the number of parsed target
+  tokens (typically one per input line), so the job scales as you add
+  or remove endpoints from the variable without touching the workflow.
 """
 
 from __future__ import annotations
@@ -104,7 +106,7 @@ async def _probe_once(target: Target, timeout: float) -> tuple[bool, str | None]
     """Perform a single TCP connect. Returns (connected, error)."""
 
     try:
-        reader, writer = await asyncio.wait_for(
+        _reader, writer = await asyncio.wait_for(
             asyncio.open_connection(target.host, target.port),
             timeout=timeout,
         )
@@ -116,18 +118,33 @@ async def _probe_once(target: Target, timeout: float) -> tuple[bool, str | None]
         # ('54.185.253.63', 443)"). For denied endpoints that IP is just
         # the harden-runner sinkhole, which makes every row of the
         # summary look identical and suggests a bug. Prefer the canonical
-        # ``os.strerror(errno)`` (e.g. "Connection refused") when errno
-        # is set, and fall back to the exception class name otherwise.
-        if exc.errno:
-            return False, os.strerror(exc.errno)
+        # ``os.strerror(errno)`` (e.g. "Connection refused") for normal
+        # positive socket errno values. Resolver failures (typically
+        # ``socket.gaierror``) use negative ``EAI_*`` codes for which
+        # ``os.strerror()`` returns unhelpful text like
+        # "Unknown error -2"; fall back to the synthesised message for
+        # those, which does not embed an IP because resolution failed
+        # before a connect was attempted.
+        if exc.errno is not None:
+            if exc.errno > 0:
+                return False, os.strerror(exc.errno)
+            if exc.errno < 0:
+                return False, exc.strerror or str(exc) or type(exc).__name__
         return False, type(exc).__name__
     else:
         writer.close()
         try:
             await writer.wait_closed()
-        except (OSError, asyncio.CancelledError):
+        except OSError:
+            # A half-open transport failing to close cleanly does not
+            # invalidate the fact that the connect succeeded; log
+            # nothing and return success.
             pass
-        del reader
+        # Intentionally do not catch ``asyncio.CancelledError`` here:
+        # suppressing it would clear the task's cancelled state and
+        # let a probe report "connected" even though the runner is
+        # tearing the step down. Let it propagate so the event loop
+        # honours the cancellation quickly.
         return True, None
 
 
@@ -186,7 +203,11 @@ async def run_probes(
             timeout=overall_timeout,
         )
     except TimeoutError:
-        # Collect whatever has completed; mark the rest as timed out.
+        # The overall wall-clock cap expired. Collect whatever has
+        # completed; distinguish cleanly-finished tasks, tasks that
+        # raised, and tasks still running so a real bug in
+        # ``probe_target()`` is surfaced rather than being silently
+        # relabelled as an overall-timeout.
         done = []
         for task, target in zip(tasks, targets, strict=True):
             if task.done() and not task.cancelled():
@@ -194,6 +215,18 @@ async def run_probes(
                 if exc is None:
                     done.append(task.result())
                     continue
+                # Task finished by raising: preserve the error so it
+                # shows up in the summary instead of being masked.
+                done.append(
+                    Result(
+                        target=target,
+                        connected=False,
+                        attempts=0,
+                        error=f"probe raised {type(exc).__name__}: {exc}",
+                    )
+                )
+                continue
+            # Task did not finish within the wall-clock cap.
             task.cancel()
             done.append(
                 Result(
@@ -257,8 +290,17 @@ def render_summary(
                 failures += 1
             lines.append(f"| `{result.target.label}` | allowed | {result.attempts} | {verdict} |")
         else:
+            # A probe is only "blocked" if it was actually attempted.
+            # An overall-timeout (or any other reason we never produced
+            # a real attempt) leaves the endpoint untested; treat that
+            # as a failure so a run that hits the wall-clock cap does
+            # not silently report 0 leaks.
+            incomplete = result.attempts == 0
             if result.connected:
                 verdict = "LEAKED (connected)"
+                failures += 1
+            elif incomplete:
+                verdict = f"INCOMPLETE ({result.error or 'not attempted'})"
                 failures += 1
             else:
                 verdict = f"blocked ({result.error or 'no connection'})"
@@ -303,6 +345,28 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
             pass
 
 
+def _positive_float(value: str) -> float:
+    """Argparse type: parse a strictly positive float."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {parsed}")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    """Argparse type: parse a strictly positive integer."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {parsed}")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for the CLI."""
 
@@ -325,21 +389,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--connect-timeout",
-        type=float,
+        type=_positive_float,
         default=5.0,
-        help="Per-attempt TCP connect timeout in seconds (default: 5).",
+        help="Per-attempt TCP connect timeout in seconds, > 0 (default: 5).",
     )
     parser.add_argument(
         "--max-attempts",
-        type=int,
+        type=_positive_int,
         default=3,
-        help="Max attempts per permitted target (default: 3).",
+        help="Max attempts per permitted target, >= 1 (default: 3).",
     )
     parser.add_argument(
         "--overall-timeout",
-        type=float,
+        type=_positive_float,
         default=60.0,
-        help="Hard wall-clock cap for the whole run in seconds (default: 60).",
+        help="Hard wall-clock cap for the whole run in seconds, > 0 (default: 60).",
     )
     return parser
 
@@ -392,6 +456,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     except asyncio.CancelledError:
+        # Signal handlers cancelled every pending task. Give those
+        # tasks one quick spin on the loop to finalise — this avoids
+        # "Task was destroyed but it is pending!" warnings and closes
+        # any half-open transports cleanly. The cancellation is
+        # authoritative, so ``return_exceptions=True`` swallows the
+        # re-raised CancelledErrors without failing the drain.
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:  # pragma: no cover - defensive only
+                pass
         print("::warning::Probe run was cancelled", file=sys.stderr)
         return 130
     finally:
@@ -409,11 +487,14 @@ def main(argv: list[str] | None = None) -> int:
     print(summary)
 
     if failures:
-        noun = "blocked" if mode == "permitted" else "reached"
-        print(
-            f"::error::{failures} endpoint(s) were unexpectedly {noun}",
-            file=sys.stderr,
-        )
+        if mode == "permitted":
+            msg = f"{failures} endpoint(s) were unexpectedly blocked"
+        else:
+            msg = (
+                f"{failures} endpoint(s) were unexpectedly reached or "
+                "left untested (see summary for per-endpoint verdicts)"
+            )
+        print(f"::error::{msg}", file=sys.stderr)
         return 1
     return 0
 

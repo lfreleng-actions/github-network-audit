@@ -15,8 +15,11 @@
 #
 #   * runs all probes in parallel with a hard wall-clock cap,
 #   * cancels immediately on SIGTERM/SIGINT (step cancellation works), and
-#   * derives expected pass/fail counts from the input line count, so the
-#     variables are freely extensible without editing the workflow.
+#   * derives expected pass/fail counts from the number of parsed
+#     target tokens (typically one per input line, but blank lines,
+#     full-line ``#`` comments and inline ``# comment`` trailers are
+#     tolerated), so the variables are freely extensible without
+#     editing the workflow.
 #
 # Expected variables (configure at repo or org level):
 #
@@ -71,6 +74,7 @@ jobs:
     outputs:
       whitelist: ${{ steps.normalise.outputs.whitelist }}
       count: ${{ steps.normalise.outputs.count }}
+      skip: ${{ steps.normalise.outputs.skip }}
     steps:
       # yamllint disable-line rule:line-length
       - uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
@@ -82,9 +86,33 @@ jobs:
         shell: bash
         env:
           RAW_WHITELIST: ${{ vars.CONNECTION_WHITELIST }}
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork || false }}
         run: |
           set -u
+          # Pull requests from forks do not expose repository or
+          # organisation variables for security reasons. Skipping
+          # avoids a confusing hard-fail for external contributors
+          # who cannot set ``CONNECTION_WHITELIST`` themselves; the
+          # workflow still runs on push / workflow_dispatch / internal
+          # PRs where the variable is available.
           if [ -z "${RAW_WHITELIST:-}" ]; then
+            if [ "${IS_FORK_PR}" = "true" ]; then
+              notice="CONNECTION_WHITELIST not set (fork PR?); skipping tests"
+              echo "::notice::${notice}"
+              {
+                echo "skip=true"
+                echo "whitelist="
+                echo "count=0"
+              } >> "$GITHUB_OUTPUT"
+              {
+                echo "## 📋 Allowlist Preparation (skipped)"
+                echo ""
+                echo "Fork pull requests cannot read repository"
+                echo "variables, so the PERMITTED and DENIED connection"
+                echo "tests were skipped on this run."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
             echo "::error::CONNECTION_WHITELIST variable is not set"
             exit 1
           fi
@@ -96,10 +124,26 @@ jobs:
             | tr -s ' ' \
             | sed 's/^ //; s/ $//')"
 
+          # Fail fast if the variable was whitespace-only: normalisation
+          # would otherwise silently produce an empty allowed-endpoints
+          # input and every downstream probe would leak through.
+          empty_msg="CONNECTION_WHITELIST empty after normalisation"
+          zero_msg="CONNECTION_WHITELIST yielded 0 host:port entries"
+          if [ -z "$normalised" ]; then
+            echo "::error::${empty_msg}"
+            exit 1
+          fi
+
           count="$(printf '%s' "$normalised" | tr ' ' '\n' \
             | grep -c . || true)"
 
+          if [ "$count" -eq 0 ]; then
+            echo "::error::${zero_msg}"
+            exit 1
+          fi
+
           {
+            echo "skip=false"
             echo "whitelist=${normalised}"
             echo "count=${count}"
           } >> "$GITHUB_OUTPUT"
@@ -118,6 +162,7 @@ jobs:
     name: "Test PERMITTED"
     runs-on: ubuntu-latest
     needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
     permissions:
       contents: read
     # Script has its own 60s overall cap; 3 min is generous headroom
@@ -153,6 +198,7 @@ jobs:
     name: "Test DENIED"
     runs-on: ubuntu-latest
     needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
     permissions:
       contents: read
     timeout-minutes: 3

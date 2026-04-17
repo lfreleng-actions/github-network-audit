@@ -8,8 +8,15 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    # Import the real type for mypy; at runtime we use the dynamically
+    # loaded module below so the script under test stays importable
+    # from its ``scripts/`` location without a package install.
+    from connection_test import Result as _Result
 
 # The connection tester lives under ``scripts/`` rather than in the
 # installed package (it is invoked directly by the testing workflow),
@@ -17,13 +24,20 @@ import pytest
 # polluting the package layout.
 _SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "connection_test.py"
 _spec = importlib.util.spec_from_file_location("connection_test", _SCRIPT_PATH)
-assert _spec is not None and _spec.loader is not None
+if _spec is None or _spec.loader is None:
+    # ``assert`` would be stripped under ``python -O``, turning this
+    # into a harder-to-diagnose failure at module load time. Raise
+    # ImportError so the failure mode is explicit and runs under any
+    # optimisation level.
+    raise ImportError(f"Unable to load module spec for {_SCRIPT_PATH}")
 connection_test = importlib.util.module_from_spec(_spec)
 sys.modules["connection_test"] = connection_test
 _spec.loader.exec_module(connection_test)
 
 Result = connection_test.Result
 Target = connection_test.Target
+_positive_float = connection_test._positive_float
+_positive_int = connection_test._positive_int
 _probe_once = connection_test._probe_once
 parse_targets = connection_test.parse_targets
 render_summary = connection_test.render_summary
@@ -101,7 +115,7 @@ class TestRenderSummary:
     @staticmethod
     def _make_results(
         *specs: tuple[str, int, bool, int, str | None],
-    ) -> list[object]:
+    ) -> list[_Result]:
         """Build ``Result`` objects from ``(host, port, connected, attempts, error)``."""
         return [
             Result(
@@ -171,27 +185,133 @@ class TestRenderSummary:
         assert "**Failures:** 0 / 2" in text
         assert text.count("`example.com:443`") == 2
 
+    def test_denied_incomplete_probe_counts_as_leak(self) -> None:
+        """An overall-timeout in denied mode is a failure, not a pass.
+
+        A denied probe that never ran (``attempts == 0``, typically
+        because the overall wall-clock cap expired before the task
+        finished) leaves the endpoint untested; treating it as
+        "blocked" would mask silent misconfigurations and let a run
+        with an aggressive ``--overall-timeout`` exit 0 without
+        actually testing anything.
+        """
+        results = self._make_results(
+            ("www.example.org", 443, False, 0, "overall-timeout"),
+            ("www.wikipedia.org", 443, False, 1, "refused"),
+        )
+        text, failures = render_summary(results, mode="denied", connect_timeout=5.0, max_attempts=1)
+        assert failures == 1
+        assert "**Leaks:** 1 / 2" in text
+        assert "INCOMPLETE (overall-timeout)" in text
+        assert "blocked (refused)" in text
+
 
 class TestProbeError:
-    """Integration check: ``_probe_once`` must not leak IP addresses."""
+    """Unit tests for ``_probe_once``'s error-formatting logic."""
 
-    def test_refused_error_message_has_no_ip(self) -> None:
+    def test_refused_error_message_has_no_ip(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A refused connect reports a canonical errno message.
 
         asyncio's own ``str(exc)`` formatting embeds the resolved IP
         address for connect failures. Under harden-runner every denied
         target resolves to the same sinkhole address, which made every
         row of the denied-mode summary look identical and suggested a
-        bug. Exercise a real refused connect on ``127.0.0.1:1`` and
-        assert that the error string contains neither the address nor
-        the port so the summary stays informative.
+        bug. Simulate a refused connect by patching
+        ``asyncio.open_connection`` (so the test is deterministic on
+        any platform and does not depend on whether ``127.0.0.1:1`` is
+        actually open) and assert that the error string contains
+        neither the address nor the port.
         """
         import asyncio
+        import errno
 
-        connected, error = asyncio.run(_probe_once(Target("127.0.0.1", 1), 2.0))
+        async def _fake_refused(*_a: object, **_k: object) -> None:
+            # Emulate a real ConnectionRefusedError whose ``str(exc)``
+            # embeds the peer address, just like asyncio's wrapper.
+            raise ConnectionRefusedError(
+                errno.ECONNREFUSED,
+                "Connect call failed ('1.2.3.4', 443)",
+            )
+
+        monkeypatch.setattr(connection_test.asyncio, "open_connection", _fake_refused)
+
+        connected, error = asyncio.run(_probe_once(Target("peer.example", 443), 2.0))
         assert connected is False
         assert error is not None
-        assert "127.0.0.1" not in error
-        assert ":1" not in error
-        # Canonical POSIX message across macOS and Linux.
-        assert error == "Connection refused"
+        assert "1.2.3.4" not in error
+        assert ":443" not in error
+        # Compare against os.strerror directly so the test is not
+        # sensitive to the host's locale (which could translate the
+        # English text) nor to minor wording differences across
+        # platforms.
+        import os
+
+        assert error == os.strerror(errno.ECONNREFUSED)
+
+    def test_resolver_failure_keeps_synthesised_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Negative EAI_* errno falls back to the synthesised message.
+
+        ``os.strerror()`` returns "Unknown error -N" for the negative
+        ``EAI_*`` codes used by ``socket.gaierror``, so those paths
+        must preserve the exception's strerror / str(exc) text, which
+        for resolver failures does not embed an IP because DNS
+        resolution failed before a connect was attempted.
+        """
+        import asyncio
+        import socket
+
+        async def _fake_gaierror(*_a: object, **_k: object) -> None:
+            raise socket.gaierror(-2, "Name or service not known")
+
+        monkeypatch.setattr(connection_test.asyncio, "open_connection", _fake_gaierror)
+
+        connected, error = asyncio.run(_probe_once(Target("no-such-host.example", 443), 2.0))
+        assert connected is False
+        assert error == "Name or service not known"
+
+
+class TestArgValidators:
+    """Unit tests for the ``argparse`` type validators."""
+
+    def test_positive_float_accepts_positive(self) -> None:
+        """A positive numeric string round-trips to float."""
+        assert _positive_float("2.5") == 2.5
+
+    def test_positive_float_rejects_zero(self) -> None:
+        """Zero is out of range for a strictly positive float."""
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError, match="> 0"):
+            _positive_float("0")
+
+    def test_positive_float_rejects_negative(self) -> None:
+        """Negative values are out of range."""
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError, match="> 0"):
+            _positive_float("-1")
+
+    def test_positive_float_rejects_non_numeric(self) -> None:
+        """A non-numeric value produces an argparse error."""
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError, match="expected a number"):
+            _positive_float("abc")
+
+    def test_positive_int_accepts_one(self) -> None:
+        """One is the minimum valid attempt count."""
+        assert _positive_int("1") == 1
+
+    def test_positive_int_rejects_zero(self) -> None:
+        """Zero would produce a zero-iteration probe loop."""
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError, match=">= 1"):
+            _positive_int("0")
+
+    def test_positive_int_rejects_non_integer(self) -> None:
+        """Non-integer values are rejected before validation."""
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError, match="expected an integer"):
+            _positive_int("1.5")

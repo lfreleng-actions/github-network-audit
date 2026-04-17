@@ -90,8 +90,7 @@ blocks that AS33028 announces, for reference.
 raw IP ranges, so the testing workflow in this repository ignores the
 file and you MUST NOT add the CIDR entries to `CONNECTION_WHITELIST`.
 When a workflow reports blocked egress to an unfamiliar IP, resolve
-the
-destination manually (for example with `whois` or
+the destination manually (for example with `whois` or
 [bgp.he.net](https://bgp.he.net/AS33028)) and compare against the CIDR
 list in the resource file. If the address falls inside an AS33028 range,
 adding the corresponding LF-operated hostname (for example
