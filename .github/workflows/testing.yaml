@@ -151,8 +151,8 @@ jobs:
           {
             echo "## 📋 Allowlist Preparation"
             echo ""
-            echo "- Normalised **${count}** \`host:port\` entries from"
-            echo "  \`vars.CONNECTION_WHITELIST\`."
+            echo "- Normalised **${count}** \`host:port\` entries from:"
+            echo "  \`vars.CONNECTION_WHITELIST\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------
