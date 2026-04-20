@@ -77,3 +77,28 @@ The tool caches all data locally for idempotent operation.
 
 All intermediate data persists on disk. Follow-up runs use cached data
 by default. Use `--refresh` to force re-fetching from APIs.
+
+## VEXXHOST Infrastructure
+
+The Linux Foundation uses [VEXXHOST](https://vexxhost.com/) for some
+infrastructure needs, running servers and software in their data centres.
+The `resources/VEXXHOST.txt` file catalogues the IPv4 and IPv6 CIDR
+blocks that AS33028 announces, for reference.
+
+**harden-runner does not accept CIDR blocks in its allowlist.** The
+`allowed-endpoints` input expects DNS names (`host:port`) rather than
+raw IP ranges, so the testing workflow in this repository ignores the
+file and you MUST NOT add the CIDR entries to `CONNECTION_WHITELIST`.
+When a workflow reports blocked egress to an unfamiliar IP, resolve
+the destination manually (for example with `whois` or
+[bgp.he.net](https://bgp.he.net/AS33028)) and compare against the CIDR
+list in the resource file. If the address falls inside an AS33028 range,
+adding the corresponding LF-operated hostname (for example
+`gerrit.linuxfoundation.org:443`) to the allowlist is the correct fix.
+CIDR-based egress enforcement requires mechanisms outside
+harden-runner, such as iptables on self-hosted runners or the
+StepSecurity Policy Store.
+
+Because provider allocations change over time, verify or refresh the
+CIDR list against a current authoritative view of AS33028 when
+troubleshooting; the resource file records its source URL at the top.

@@ -1,0 +1,226 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Connection allowlist validation workflow
+#
+# This workflow exercises the allowlist produced for lfreleng-actions
+# against a locked-down harden-runner configuration. It verifies that:
+#
+#   * every endpoint listed in `vars.TEST_PERMITTED` is reachable, and
+#   * every endpoint listed in `vars.TEST_DENIED` is blocked.
+#
+# The heavy lifting happens in `scripts/connection_test.py`, an
+# asyncio-based probe harness that:
+#
+#   * runs all probes in parallel with a hard wall-clock cap,
+#   * cancels immediately on SIGTERM/SIGINT (step cancellation works), and
+#   * derives expected pass/fail counts from the number of parsed
+#     target tokens (typically one per input line, but blank lines,
+#     full-line ``#`` comments and inline ``# comment`` trailers are
+#     tolerated), so the variables are freely extensible without
+#     editing the workflow.
+#
+# Expected variables (configure at repo or org level):
+#
+#   CONNECTION_WHITELIST
+#     `host:port` entries separated by newlines OR spaces. The
+#     `prepare` job normalises the value; harden-runner's
+#     `allowed-endpoints` input expects a single whitespace-separated
+#     string, and pasting a multi-line variable directly causes only
+#     the first line to be honoured.
+#
+#   TEST_PERMITTED
+#     One `host:port` entry per line. MUST be a subset of
+#     `CONNECTION_WHITELIST`; each entry is expected to connect.
+#
+#   TEST_DENIED
+#     One `host:port` entry per line. MUST NOT appear in
+#     `CONNECTION_WHITELIST`; each entry is expected to be blocked.
+#
+# Note: VEXXHOST CIDR blocks are intentionally NOT consumed by this
+# workflow. harden-runner's `allowed-endpoints` input is DNS-based
+# and does not accept CIDRs, so there is nothing to validate
+# automatically. See `resources/VEXXHOST.txt` and the README for
+# guidance on manual verification of blocked egress against
+# AS33028 ranges.
+
+name: "Test Network Connections 🧪"
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # ---------------------------------------------------------------
+  # Normalise the CONNECTION_WHITELIST variable
+  # ---------------------------------------------------------------
+  prepare:
+    name: "Normalise allowlist"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      whitelist: ${{ steps.normalise.outputs.whitelist }}
+      count: ${{ steps.normalise.outputs.count }}
+      skip: ${{ steps.normalise.outputs.skip }}
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: audit
+
+      - name: "Normalise CONNECTION_WHITELIST"
+        id: normalise
+        shell: bash
+        env:
+          RAW_WHITELIST: ${{ vars.CONNECTION_WHITELIST }}
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork || false }}
+        run: |
+          set -u
+          # Pull requests from forks do not expose repository or
+          # organisation variables for security reasons. Skipping
+          # avoids a confusing hard-fail for external contributors
+          # who cannot set ``CONNECTION_WHITELIST`` themselves; the
+          # workflow still runs on push / workflow_dispatch / internal
+          # PRs where the variable is available.
+          if [ -z "${RAW_WHITELIST:-}" ]; then
+            if [ "${IS_FORK_PR}" = "true" ]; then
+              notice="CONNECTION_WHITELIST not set (fork PR?); skipping tests"
+              echo "::notice::${notice}"
+              {
+                echo "skip=true"
+                echo "whitelist="
+                echo "count=0"
+              } >> "$GITHUB_OUTPUT"
+              {
+                echo "## 📋 Allowlist Preparation (skipped)"
+                echo ""
+                echo "Fork pull requests cannot read repository"
+                echo "variables, so the PERMITTED and DENIED connection"
+                echo "tests were skipped on this run."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::CONNECTION_WHITELIST variable is not set"
+            exit 1
+          fi
+
+          # Collapse all whitespace (newlines, tabs, multiple spaces)
+          # into single spaces and strip leading/trailing whitespace.
+          normalised="$(printf '%s' "$RAW_WHITELIST" \
+            | tr '\r\n\t' '   ' \
+            | tr -s ' ' \
+            | sed 's/^ //; s/ $//')"
+
+          # Fail fast if the variable was whitespace-only: normalisation
+          # would otherwise silently produce an empty allowed-endpoints
+          # input and every downstream probe would leak through.
+          empty_msg="CONNECTION_WHITELIST empty after normalisation"
+          zero_msg="CONNECTION_WHITELIST yielded 0 host:port entries"
+          if [ -z "$normalised" ]; then
+            echo "::error::${empty_msg}"
+            exit 1
+          fi
+
+          count="$(printf '%s' "$normalised" | tr ' ' '\n' \
+            | grep -c . || true)"
+
+          if [ "$count" -eq 0 ]; then
+            echo "::error::${zero_msg}"
+            exit 1
+          fi
+
+          {
+            echo "skip=false"
+            echo "whitelist=${normalised}"
+            echo "count=${count}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 📋 Allowlist Preparation"
+            echo ""
+            echo "- Normalised **${count}** \`host:port\` entries from:"
+            echo "  \`vars.CONNECTION_WHITELIST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------
+  # Positive test: whitelisted endpoints MUST be reachable
+  # ---------------------------------------------------------------
+  positive-connection-tests:
+    name: "Test PERMITTED"
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    permissions:
+      contents: read
+    # Script has its own 60s overall cap; 3 min is generous headroom
+    # for the harden-runner agent install and repo checkout.
+    timeout-minutes: 3
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: block
+          disable-sudo: true
+          allowed-endpoints: ${{ needs.prepare.outputs.whitelist }}
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: "Run permitted connection tests"
+        shell: bash
+        env:
+          TEST_PERMITTED: ${{ vars.TEST_PERMITTED }}
+        run: |
+          python3 scripts/connection_test.py \
+            --mode permitted \
+            --targets-env TEST_PERMITTED \
+            --connect-timeout 5 \
+            --max-attempts 3 \
+            --overall-timeout 60
+
+  # ---------------------------------------------------------------
+  # Negative test: non-whitelisted endpoints MUST be blocked
+  # ---------------------------------------------------------------
+  negative-connection-tests:
+    name: "Test DENIED"
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    permissions:
+      contents: read
+    timeout-minutes: 3
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@6c3c2f2c1c457b00c10c4848d6f5491db3b629df # v2.18.0
+        with:
+          egress-policy: block
+          disable-sudo: true
+          allowed-endpoints: ${{ needs.prepare.outputs.whitelist }}
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: "Run denied connection tests"
+        shell: bash
+        env:
+          TEST_DENIED: ${{ vars.TEST_DENIED }}
+        run: |
+          python3 scripts/connection_test.py \
+            --mode denied \
+            --targets-env TEST_DENIED \
+            --connect-timeout 5 \
+            --max-attempts 1 \
+            --overall-timeout 30
