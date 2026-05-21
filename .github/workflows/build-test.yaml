@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 5
     steps:
       # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99  # v2.19.2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: audit
 
@@ -75,7 +75,7 @@ jobs:
       GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
     steps:
       # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99  # v2.19.2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'audit'
 
@@ -126,7 +126,7 @@ jobs:
     timeout-minutes: 12
     steps:
       # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99  # v2.19.2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'audit'
 
@@ -151,7 +151,7 @@ jobs:
     timeout-minutes: 12
     steps:
       # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99  # v2.19.2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: audit
 
@@ -177,7 +177,7 @@ jobs:
     timeout-minutes: 10
     steps:
       # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99  # v2.19.2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
         with:
           egress-policy: 'audit'
 
