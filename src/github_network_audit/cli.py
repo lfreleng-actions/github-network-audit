@@ -6,20 +6,63 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 
 import click
 import typer
 from rich.console import Console
 
+from github_network_audit import __version__
 from github_network_audit.collector import NetworkAuditCollector
 from github_network_audit.reporter import NetworkAuditReporter
 
-app = typer.Typer(
+console = Console()
+
+
+def version_callback(value: bool) -> bool:
+    """Callback to show version and exit."""
+    if value:
+        console.print(f"🏷️  github-network-audit version {__version__}")
+        raise typer.Exit()
+    return value
+
+
+class CustomTyper(typer.Typer):
+    """Custom Typer class that shows version in help."""
+
+    def __call__(self, *args, **kwargs):
+        # Derive argv from an explicit args= kwarg when present (programmatic
+        # invocation), otherwise fall back to the process arguments.
+        argv = kwargs.get("args")
+        if argv is None:
+            argv = sys.argv[1:]
+        # Show the version banner alongside help output, but skip it when
+        # --version is requested, since version_callback already prints it.
+        if ("--help" in argv or "-h" in argv) and "--version" not in argv:
+            console.print(f"🏷️  github-network-audit version {__version__}")
+        return super().__call__(*args, **kwargs)
+
+
+app = CustomTyper(
     name="github-network-audit",
     help="Audit outbound network connections from GitHub Actions.",
 )
-console = Console()
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=version_callback,
+        is_eager=True,
+        help="Show version and exit.",
+    ),
+) -> None:
+    """GitHub Network Audit command line interface."""
+    # The actual handling is done via the version_callback.
+    # This callback exists only to expose --version at the top level.
 
 
 @app.command()
