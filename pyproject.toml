@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "github-network-audit"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Audit outbound network connections from GitHub Actions workflow runs"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,6 +21,12 @@ dependencies = [
 
 [project.scripts]
 github-network-audit = "github_network_audit.cli:app"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/github_network_audit/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/github_network_audit"]
