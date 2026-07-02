@@ -1,12 +1,18 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2026 The Linux Foundation
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
 
-# Runs on tag push, validates, builds, tests, and releases
+# Runs on a tag push: builds, tests and promotes the GitHub release.
+#
+# This project publishes GitHub releases only; it does not publish a
+# package to PyPI, so no trusted-publishing jobs are required here. The
+# reusable `release` job builds, tests, audits, attaches artefacts and
+# promotes the draft release.
 name: 'Python Build/Test/Release'
 
 # yamllint disable-line rule:truthy
 on:
+  # Trigger on tag push events
   push:
     tags:
       - '**'
@@ -14,237 +20,16 @@ on:
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  repository-metadata:
-    name: "Repository Metadata"
-    runs-on: ubuntu-latest
+  release:
+    name: 'Build/Test/Release'
     permissions:
-      contents: read
-      pull-requests: read
-    timeout-minutes: 5
-    steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: audit
-
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          fetch-depth: 0
-
-      - name: "Gather repository metadata"
-        id: repo-metadata
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/repository-metadata-action@fa041b9502f8c81930b5afc9d30d1c8ecb22e790  # v0.2.1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          github_summary: 'true'
-          gerrit_summary: 'false'
-          artifact_upload: 'true'
-          artifact_formats: 'json'
-
-  tag-validate:
-    name: 'Validate Tag Push'
-    runs-on: 'ubuntu-latest'
-    permissions:
-      contents: write
-    timeout-minutes: 5
-    outputs:
-      tag: "${{ steps.tag-validate.outputs.tag_name }}"
-    steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: 'audit'
-
-      - name: 'Checkout repository'
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: 'Verify pushed tag'
-        id: 'tag-validate'
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/tag-validate-action@bc8043ec074495cc8cdf351623ebab3675d563cf  # v1.0.4
-        with:
-          token: "${{ secrets.GITHUB_TOKEN }}"
-          require_type: 'semver'
-          reject_development: 'true'
-          require_github: 'true'
-          # yamllint disable-line rule:line-length
-          require_signed: 'ssh,gpg-unverifiable'
-
-      - name: 'Ensure draft release exists'
-        id: 'ensure-release'
-        shell: bash
-        env:
-          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-        run: |
-          # Ensure draft release exists
-          TAG="${{ steps.tag-validate.outputs.tag_name }}"
-          if RELEASE_INFO=$(gh release view "$TAG" \
-            --json isDraft 2>/dev/null); then
-            IS_DRAFT=$(echo "$RELEASE_INFO" | jq -r '.isDraft')
-            if [ "$IS_DRAFT" = "true" ]; then
-              echo "Draft release for tag $TAG already exists"
-            else
-              echo "Published release for $TAG already exists"
-            fi
-          else
-            echo "Creating draft release for tag $TAG"
-            gh release create "$TAG" \
-              --draft \
-              --title "Release $TAG" \
-              --notes "Automated release for $TAG"
-          fi
-
-  python-build:
-    name: 'Python Build'
-    needs: 'tag-validate'
-    runs-on: 'ubuntu-latest'
-    outputs:
-      matrix_json: "${{ steps.python-build.outputs.matrix_json }}"
-      artefact_name: "${{ steps.python-build.outputs.artefact_name }}"
-      artefact_path: "${{ steps.python-build.outputs.artefact_path }}"
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    timeout-minutes: 12
-    env:
-      GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-    steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: 'audit'
-
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: 'Build Python project'
-        id: 'python-build'
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/python-build-action@97cf36d2a5914c94761408545d154c983024de1d  # v2.0.0
-        with:
-          sigstore_sign: true
-          attestations: true
-
-  python-tests:
-    name: 'Python Tests'
-    runs-on: 'ubuntu-latest'
-    needs: 'python-build'
-    strategy:
-      fail-fast: false
-      matrix: "${{ fromJson(needs.python-build.outputs.matrix_json) }}"
-    permissions:
-      contents: read
-    timeout-minutes: 12
-    steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: 'audit'
-
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: 'Test Python project [PYTEST]'
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/python-test-action@4129c285f63e4d004b9e615b881f44cd63ba5f45  # v1.2.0
-        with:
-          python_version: "${{ matrix.python-version }}"
-
-  python-audit:
-    name: 'Python Audit'
-    runs-on: 'ubuntu-latest'
-    needs: 'python-build'
-    strategy:
-      fail-fast: false
-      matrix: "${{ fromJson(needs.python-build.outputs.matrix_json) }}"
-    permissions:
-      contents: read
-    timeout-minutes: 10
-    steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: 'audit'
-
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: 'Audit Python project'
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/python-audit-action@fcb1b2e0cdbe19edf11057e598138f3d57f2b249  # v0.3.1
-        with:
-          python_version: "${{ matrix.python-version }}"
-          permit_fail: "${{ vars.NO_BLOCK_AUDIT_FAIL == 'true' }}"
-
-  attach-artefacts:
-    name: 'Attach Artefacts to Release'
-    runs-on: 'ubuntu-latest'
-    needs:
-      - 'tag-validate'
-      - 'python-build'
-      - 'python-tests'
-      - 'python-audit'
-    permissions:
-      contents: write
-    timeout-minutes: 5
-    env:
-      GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-    steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: 'audit'
-
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: 'Download build artefacts'
-        # yamllint disable-line rule:line-length
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          name: "${{ needs.python-build.outputs.artefact_name }}"
-          path: "${{ needs.python-build.outputs.artefact_path }}"
-
-      - name: 'Attach build artefacts to release'
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/release-assets-action@22a6302f3d1775e4a192c45235cc7833a2781b12  # v0.1.1
-        with:
-          asset_paths: '["${{ needs.python-build.outputs.artefact_path }}/**"]'
-          release_tag: "${{ needs.tag-validate.outputs.tag }}"
-
-  promote-release:
-    name: 'Promote Draft Release'
-    needs:
-      - 'tag-validate'
-      - 'attach-artefacts'
-    runs-on: 'ubuntu-latest'
-    permissions:
-      contents: write
-    timeout-minutes: 2
-    steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: 'audit'
-
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: 'Promote draft release'
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/draft-release-promote-action@072990900b99030363d81d4131c2bf2855f07df0  # v0.1.4
-        with:
-          token: "${{ secrets.GITHUB_TOKEN }}"
-          tag: "${{ needs.tag-validate.outputs.tag }}"
-          latest: true
+      contents: write       # Create the GitHub release / attach assets
+      id-token: write       # OIDC for build provenance attestations
+      attestations: write   # Build provenance attestations
+    # Pinned to python-workflows v0.1.1 release commit
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/python-workflows/.github/workflows/build-test-release.yaml@4f48e1cd660f94ab9f1d4bbc15a948c1aca105ad  # v0.1.1
