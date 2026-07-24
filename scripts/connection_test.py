@@ -257,8 +257,8 @@ def render_summary(
     if mode == "permitted":
         heading = "## Test PERMITTED Connections"
         blurb = (
-            "Endpoints expected to be reachable through the "
-            "`CONNECTION_WHITELIST`. Each probe is retried up to "
+            "Endpoints expected to be reachable through the egress "
+            "allow-list. Each probe is retried up to "
             f"**{max_attempts}** times with a **{connect_timeout:g}s** "
             "per-attempt timeout."
         )
@@ -268,7 +268,7 @@ def render_summary(
         heading = "## Test DENIED Connections"
         blurb = (
             "Endpoints expected to be blocked by harden-runner (not "
-            "present in `CONNECTION_WHITELIST`). Each probe is a "
+            "present in the egress allow-list). Each probe is a "
             f"single **{connect_timeout:g}s** attempt; any failure to "
             "connect within that attempt is treated as blocked "
             "(harden-runner redirects denied DNS lookups to its "

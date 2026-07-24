@@ -88,7 +88,7 @@ blocks that AS33028 announces, for reference.
 **harden-runner does not accept CIDR blocks in its allowlist.** The
 `allowed-endpoints` input expects DNS names (`host:port`) rather than
 raw IP ranges, so the testing workflow in this repository ignores the
-file and you MUST NOT add the CIDR entries to `CONNECTION_WHITELIST`.
+file and you MUST NOT add the CIDR entries to the egress allow-list.
 When a workflow reports blocked egress to an unfamiliar IP, resolve
 the destination manually (for example with `whois` or
 [bgp.he.net](https://bgp.he.net/AS33028)) and compare against the CIDR
