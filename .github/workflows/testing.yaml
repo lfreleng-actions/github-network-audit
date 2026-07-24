@@ -10,6 +10,17 @@
 #   * every endpoint listed in `vars.TEST_PERMITTED` is reachable, and
 #   * every endpoint listed in `vars.TEST_DENIED` is blocked.
 #
+# The egress allow-list is loaded out-of-band from the organisation's
+# `.github` repository by `lfreleng-actions/harden-runner-block-action`,
+# which fetches the pinned `allow_list.txt`, strips its `#` comments,
+# collapses all whitespace into the single space-separated string
+# harden-runner's `allowed-endpoints` input expects, and publishes it
+# as `$CONNECTION_ALLOW_LIST`. The subsequent `step-security/harden-runner`
+# step consumes that value in `block` egress mode. Loading the list
+# out-of-band means the workflow no longer depends on any org- or
+# repo-level GitHub variable holding the allow-list, so it also works
+# for pull requests raised from forks.
+#
 # The heavy lifting happens in `scripts/connection_test.py`, an
 # asyncio-based probe harness that:
 #
@@ -23,20 +34,17 @@
 #
 # Expected variables (configure at repo or org level):
 #
-#   CONNECTION_WHITELIST
-#     `host:port` entries separated by newlines OR spaces. The
-#     `prepare` job normalises the value; harden-runner's
-#     `allowed-endpoints` input expects a single whitespace-separated
-#     string, and pasting a multi-line variable directly causes only
-#     the first line to be honoured.
-#
 #   TEST_PERMITTED
-#     One `host:port` entry per line. MUST be a subset of
-#     `CONNECTION_WHITELIST`; each entry is expected to connect.
+#     One `host:port` entry per line. MUST be a subset of the egress
+#     allow-list; each entry is expected to connect. Repository
+#     variables are not exposed to fork pull requests, so the PERMITTED
+#     test skips itself when the variable is unavailable.
 #
 #   TEST_DENIED
-#     One `host:port` entry per line. MUST NOT appear in
-#     `CONNECTION_WHITELIST`; each entry is expected to be blocked.
+#     One `host:port` entry per line. MUST NOT appear in the egress
+#     allow-list; each entry is expected to be blocked. Repository
+#     variables are not exposed to fork pull requests, so the DENIED
+#     test skips itself when the variable is unavailable.
 #
 # Note: VEXXHOST CIDR blocks are intentionally NOT consumed by this
 # workflow. harden-runner's `allowed-endpoints` input is DNS-based
@@ -63,118 +71,32 @@ permissions: {}
 
 jobs:
   # ---------------------------------------------------------------
-  # Normalise the CONNECTION_WHITELIST variable
-  # ---------------------------------------------------------------
-  prepare:
-    name: "Normalise allowlist"
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    timeout-minutes: 5
-    outputs:
-      whitelist: ${{ steps.normalise.outputs.whitelist }}
-      count: ${{ steps.normalise.outputs.count }}
-      skip: ${{ steps.normalise.outputs.skip }}
-    steps:
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
-        with:
-          egress-policy: audit
-
-      - name: "Normalise CONNECTION_WHITELIST"
-        id: normalise
-        shell: bash
-        env:
-          RAW_WHITELIST: ${{ vars.CONNECTION_WHITELIST }}
-          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork || false }}
-        run: |
-          set -u
-          # Pull requests from forks do not expose repository or
-          # organisation variables for security reasons. Skipping
-          # avoids a confusing hard-fail for external contributors
-          # who cannot set ``CONNECTION_WHITELIST`` themselves; the
-          # workflow still runs on push / workflow_dispatch / internal
-          # PRs where the variable is available.
-          if [ -z "${RAW_WHITELIST:-}" ]; then
-            if [ "${IS_FORK_PR}" = "true" ]; then
-              notice="CONNECTION_WHITELIST not set (fork PR?); skipping tests"
-              echo "::notice::${notice}"
-              {
-                echo "skip=true"
-                echo "whitelist="
-                echo "count=0"
-              } >> "$GITHUB_OUTPUT"
-              {
-                echo "## 📋 Allowlist Preparation (skipped)"
-                echo ""
-                echo "Fork pull requests cannot read repository"
-                echo "variables, so the PERMITTED and DENIED connection"
-                echo "tests were skipped on this run."
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "::error::CONNECTION_WHITELIST variable is not set"
-            exit 1
-          fi
-
-          # Collapse all whitespace (newlines, tabs, multiple spaces)
-          # into single spaces and strip leading/trailing whitespace.
-          normalised="$(printf '%s' "$RAW_WHITELIST" \
-            | tr '\r\n\t' '   ' \
-            | tr -s ' ' \
-            | sed 's/^ //; s/ $//')"
-
-          # Fail fast if the variable was whitespace-only: normalisation
-          # would otherwise silently produce an empty allowed-endpoints
-          # input and every downstream probe would leak through.
-          empty_msg="CONNECTION_WHITELIST empty after normalisation"
-          zero_msg="CONNECTION_WHITELIST yielded 0 host:port entries"
-          if [ -z "$normalised" ]; then
-            echo "::error::${empty_msg}"
-            exit 1
-          fi
-
-          count="$(printf '%s' "$normalised" | tr ' ' '\n' \
-            | grep -c . || true)"
-
-          if [ "$count" -eq 0 ]; then
-            echo "::error::${zero_msg}"
-            exit 1
-          fi
-
-          {
-            echo "skip=false"
-            echo "whitelist=${normalised}"
-            echo "count=${count}"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "## 📋 Allowlist Preparation"
-            echo ""
-            echo "- Normalised **${count}** \`host:port\` entries from:"
-            echo "  \`vars.CONNECTION_WHITELIST\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ---------------------------------------------------------------
-  # Positive test: whitelisted endpoints MUST be reachable
+  # Positive test: allowlisted endpoints MUST be reachable
   # ---------------------------------------------------------------
   positive-connection-tests:
     name: "Test PERMITTED"
     runs-on: ubuntu-latest
-    needs: prepare
-    if: needs.prepare.outputs.skip != 'true'
     permissions:
       contents: read
     # Script has its own 60s overall cap; 3 min is generous headroom
     # for the harden-runner agent install and repo checkout.
     timeout-minutes: 3
     steps:
+      # Load the egress allow-list out-of-band from the organisation's
+      # .github repository and publish it as $CONNECTION_ALLOW_LIST for
+      # the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: '@04fee5dc9ba10cb0c6c891034741a2011482c3a2'  # v0.6.2
+
       # yamllint disable-line rule:line-length
       - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
           disable-sudo: true
-          allowed-endpoints: ${{ needs.prepare.outputs.whitelist }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -186,6 +108,15 @@ jobs:
         env:
           TEST_PERMITTED: ${{ vars.TEST_PERMITTED }}
         run: |
+          set -u
+          # Repository variables are not exposed to fork pull requests,
+          # so skip (rather than hard-fail) when the probe targets are
+          # unavailable. The test still runs on push, workflow_dispatch
+          # and internal / Dependabot PRs, where the variable is set.
+          if [ -z "${TEST_PERMITTED:-}" ]; then
+            echo "::notice::TEST_PERMITTED not set (fork PR?); skipping"
+            exit 0
+          fi
           python3 scripts/connection_test.py \
             --mode permitted \
             --targets-env TEST_PERMITTED \
@@ -194,23 +125,30 @@ jobs:
             --overall-timeout 60
 
   # ---------------------------------------------------------------
-  # Negative test: non-whitelisted endpoints MUST be blocked
+  # Negative test: non-allowlisted endpoints MUST be blocked
   # ---------------------------------------------------------------
   negative-connection-tests:
     name: "Test DENIED"
     runs-on: ubuntu-latest
-    needs: prepare
-    if: needs.prepare.outputs.skip != 'true'
     permissions:
       contents: read
     timeout-minutes: 3
     steps:
+      # Load the egress allow-list out-of-band from the organisation's
+      # .github repository and publish it as $CONNECTION_ALLOW_LIST for
+      # the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: '@04fee5dc9ba10cb0c6c891034741a2011482c3a2'  # v0.6.2
+
       # yamllint disable-line rule:line-length
       - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
           disable-sudo: true
-          allowed-endpoints: ${{ needs.prepare.outputs.whitelist }}
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -222,6 +160,15 @@ jobs:
         env:
           TEST_DENIED: ${{ vars.TEST_DENIED }}
         run: |
+          set -u
+          # Repository variables are not exposed to fork pull requests,
+          # so skip (rather than hard-fail) when the probe targets are
+          # unavailable. The test still runs on push, workflow_dispatch
+          # and internal / Dependabot PRs, where the variable is set.
+          if [ -z "${TEST_DENIED:-}" ]; then
+            echo "::notice::TEST_DENIED not set (fork PR?); skipping"
+            exit 0
+          fi
           python3 scripts/connection_test.py \
             --mode denied \
             --targets-env TEST_DENIED \
