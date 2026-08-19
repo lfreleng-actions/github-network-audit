@@ -13,10 +13,9 @@ from pathlib import Path
 
 import requests
 
-logger = logging.getLogger(__name__)
+from .config import GITHUB_GRAPHQL_API, STEPSECURITY_API
 
-STEPSECURITY_API = "https://agent.api.stepsecurity.io/v1"
-GITHUB_GRAPHQL_API = "https://api.github.com/graphql"
+logger = logging.getLogger(__name__)
 
 
 class NetworkAuditCollector:
